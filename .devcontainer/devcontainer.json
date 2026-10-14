@@ -1,0 +1,12 @@
+{
+  "name": "maintenance-agent",
+  "image": "mcr.microsoft.com/devcontainers/python:3.12",
+  "features": {
+    "ghcr.io/devcontainers/features/docker-in-docker:2": {},
+    "ghcr.io/devcontainers/features/java:1": { "version": "17", "installMaven": "true" }
+  },
+  "postCreateCommand": "pip install -r requirements.txt && docker build -q -f Dockerfile.sandbox -t maintenance-agent-sandbox:latest . || true",
+  "forwardPorts": [8080],
+  "portsAttributes": { "8080": { "label": "Maintenance Agent UI", "onAutoForward": "notify", "visibility": "private" } },
+  "customizations": { "codespaces": { "openFiles": ["DEPLOY.md"] } }
+}

@@ -1,0 +1,2 @@
+{ "name": "agent-ui-tests", "private": true, "description": "jsdom smoke tests for the web component (npm install, then run via pytest)",
+  "devDependencies": { "jsdom": "^25.0.0" } }

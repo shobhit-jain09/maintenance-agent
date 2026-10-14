@@ -1,0 +1,6 @@
+pyyaml>=6.0
+tree-sitter>=0.23          # Java parsing (dead-code analysis, safe patching, syntax gate)
+tree-sitter-java>=0.23
+pytest>=8.0                # agent's own test-suite and Python repos whose tests run via pytest
+# optional, only for --llm triage:
+# anthropic>=0.40

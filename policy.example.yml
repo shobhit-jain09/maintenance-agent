@@ -1,0 +1,12 @@
+# Control-plane policy. Lives OUTSIDE the repos being analysed. Values here override built-in defaults.
+# (Repo-level .agent.yml can only tighten these, never loosen them.)
+patch:
+  max_files: 10
+  max_changed_lines: 200
+  protected_paths:          # NOTE: lists replace the defaults, so copy the defaults from agent/policy.py and extend them
+    - ".github/**"
+    - "infra/**"
+    - "src/payments/**"
+limits:
+  max_llm_calls: 20
+  run_timeout_minutes: 30

@@ -1,0 +1,7 @@
+# Sandbox image for running UNTRUSTED repo tests. Contains no credentials.
+# Build:  docker build -f Dockerfile.sandbox -t maintenance-agent-sandbox:latest .
+# Extend it with your repo's toolchain/dependencies (prebuilt layer; the container runs with --network none).
+FROM python:3.12-slim
+RUN pip install --no-cache-dir pytest==8.3.3 && useradd -u 65534 -m sandbox 2>/dev/null || true
+USER 65534:65534
+WORKDIR /work

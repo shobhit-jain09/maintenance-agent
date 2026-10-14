@@ -1,0 +1,7 @@
+# EXAMPLE ONLY (not used by the workflow). Create the real one with:  python -m agent consent grant <repo-url> ...
+repo: owner/name
+scopes: [read, execute]
+granted_by: you@example.com
+granted_at: 2026-10-09
+expires_at: 2026-11-08       # at most 90 days after granted_at
+notice_version: 1

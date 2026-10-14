@@ -1,0 +1,221 @@
+# Code Maintenance Agent: free-tier deployment on GitHub Actions.
+# Put this project in a PRIVATE repo of your own (the "agent repo"). Press "Run workflow", paste the Git URL of the
+# repository to check, type its name to give consent, pick a mode. Nothing is hosted, so nothing costs money while idle.
+# Full guide: DEPLOY.md
+name: maintenance-agent
+
+on:
+  workflow_dispatch:
+    inputs:
+      repo_url:
+        description: "Git URL of the repository to check, e.g. https://github.com/owner/name  (empty = repository variable TARGET_REPO)"
+        type: string
+        required: false
+      mode:
+        description: "analyze = read-only report | verify = run tests + build a verified patch (artifact only, NO write token) | open-pr = also push an agent/* branch and open a PR"
+        type: choice
+        options: [analyze, verify, open-pr]
+        default: analyze
+      confirm:
+        description: "CONSENT: type the repository exactly as owner/name to authorise the agent to access its code (the access notice is printed in the run log)"
+        type: string
+        required: true
+  # Enable after a few successful manual runs. Needs repository variable TARGET_REPO and a standing consent file
+  # (consents/target.yml). Scheduled runs use repository variable SCHEDULED_MODE (default: analyze).
+  # schedule:
+  #   - cron: "17 3 * * 1"   # Mondays 03:17 UTC
+
+# The built-in GITHUB_TOKEN of the agent repo only needs to read this repo. Access to the target uses YOUR tokens.
+permissions:
+  contents: read
+
+concurrency:
+  group: maintenance-agent
+  cancel-in-progress: false
+
+jobs:
+  agent:
+    # KILL SWITCH: set repository variable AGENT_ENABLED=false to stop every run immediately.
+    if: ${{ vars.AGENT_ENABLED != 'false' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      DEFAULT_TARGET: ${{ vars.TARGET_REPO }}                       # optional default (owner/name), used by scheduled runs
+      MODE: ${{ inputs.mode || vars.SCHEDULED_MODE || 'analyze' }}
+      JAVA_VERSION: ${{ vars.JAVA_VERSION || '17' }}                # Spring Boot 3.x needs 17+; 2.x often 11/8
+      SANDBOX_MEMORY: ${{ vars.SANDBOX_MEMORY || '3g' }}            # runner has ~7 GB; Spring Boot tests like 2-3 GB
+    steps:
+      - name: Check out the agent
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install the agent
+        run: pip install -r requirements.txt
+
+      # Validate the URL with the SAME code the agent uses (https + allowlisted host only; rejects credentials, odd
+      # transports and option-like strings). The value reaches the script through env, never spliced into the script.
+      - name: Resolve target repository
+        env:
+          REPO_URL_INPUT: ${{ inputs.repo_url }}
+        run: |
+          if [ -n "$REPO_URL_INPUT" ]; then URL="$REPO_URL_INPUT"
+          elif [ -n "$DEFAULT_TARGET" ]; then URL="https://github.com/$DEFAULT_TARGET"
+          else echo "::error::Give a Git URL in the 'repo_url' box (or set repository variable TARGET_REPO)."; exit 1; fi
+          SLUG=$(python -m agent consent resolve -- "$URL") || { echo "::error::Not an accepted repository URL (https://github.com/owner/name only)."; exit 1; }
+          echo "TARGET_REPO=$SLUG" >> "$GITHUB_ENV"
+          echo "Target: $SLUG   Mode: $MODE   Java: $JAVA_VERSION"
+
+      # ---- CONSENT GATE: nothing below touches the target repository until a person has authorised it -------------
+      # Manual runs: you must have typed the repo name in the 'confirm' box. Scheduled runs: a standing consent
+      # file (consents/target.yml, expires automatically) is required. The agent re-validates and prints the notice.
+      - name: Consent gate
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          CONFIRM_INPUT: ${{ inputs.confirm }}
+        run: |
+          case "$MODE" in
+            analyze) SCOPES="read" ;;
+            verify)  SCOPES="read,execute" ;;
+            open-pr) SCOPES="read,execute,write" ;;
+            *) echo "::error::unknown mode $MODE"; exit 1 ;;
+          esac
+          lower() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            if [ "$(lower "$CONFIRM_INPUT")" != "$(lower "$TARGET_REPO")" ]; then
+              echo "::error::Consent not given. Type exactly '$TARGET_REPO' in the 'confirm' box to authorise this run (scopes: $SCOPES)."
+              exit 1
+            fi
+            { echo "CONSENT_KIND=flag"; echo "CONSENT_VALUE=${TARGET_REPO}:${SCOPES}"; } >> "$GITHUB_ENV"
+          else
+            if [ ! -f consents/target.yml ]; then
+              echo "::error::Scheduled runs need a standing consent file at consents/target.yml (see consents/README.md)."
+              exit 1
+            fi
+            { echo "CONSENT_KIND=file"; echo "CONSENT_VALUE=consents/target.yml"; } >> "$GITHUB_ENV"
+          fi
+          echo "CONSENT_SCOPES=${SCOPES}" >> "$GITHUB_ENV"
+          echo "Consent: ${EVENT_NAME} by ${GITHUB_ACTOR}; requested permissions: ${SCOPES}"
+
+      - name: Preflight (tools and sandbox)
+        run: python -m agent doctor
+
+      # Repos you do not have write access to are UNTRUSTED. The cache warm-up below runs the target's own build on
+      # the runner, so for untrusted repos only the read-only 'analyze' mode (which executes nothing) is allowed.
+      - name: Trust check
+        env:
+          AGENT_READ_TOKEN: ${{ secrets.AGENT_READ_TOKEN }}
+        run: |
+          TRUST=$(python -m agent consent trust "https://github.com/${TARGET_REPO}.git")
+          echo "TRUST=$TRUST" >> "$GITHUB_ENV"
+          if [ "$MODE" != "analyze" ] && [ "$TRUST" != "trusted" ]; then
+            echo "::error::${TARGET_REPO} is UNTRUSTED (no verified write access for AGENT_READ_TOKEN). Only mode 'analyze' is allowed for it. Use a token that has access to the repo, or run analyze."
+            exit 1
+          fi
+
+      # Show exactly what is about to happen, BEFORE any code is fetched. Only repository METADATA is requested here.
+      - name: Access notice
+        env:
+          AGENT_READ_TOKEN: ${{ secrets.AGENT_READ_TOKEN }}
+        run: python -m agent consent notice "https://github.com/${TARGET_REPO}.git" --scopes "$CONSENT_SCOPES"
+
+      # ---- everything below is only needed when tests are run (verify / open-pr) -------------------------
+      - name: Check out the target (used ONLY to warm the dependency cache)
+        if: ${{ env.MODE != 'analyze' }}
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.TARGET_REPO }}
+          token: ${{ secrets.AGENT_READ_TOKEN }}
+          path: target-warm
+          persist-credentials: false
+
+      - name: Detect build tool
+        if: ${{ env.MODE != 'analyze' }}
+        run: |
+          if   [ -f target-warm/pom.xml ];          then echo "BUILD_TOOL=maven"  >> "$GITHUB_ENV"
+          elif [ -f target-warm/build.gradle ] || [ -f target-warm/build.gradle.kts ]; then echo "BUILD_TOOL=gradle" >> "$GITHUB_ENV"
+          else echo "::error::No pom.xml or build.gradle(.kts) at the root of $TARGET_REPO"; exit 1; fi
+
+      - uses: actions/setup-java@v4
+        if: ${{ env.MODE != 'analyze' }}
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - name: Cache Maven dependencies
+        if: ${{ env.MODE != 'analyze' && env.BUILD_TOOL == 'maven' }}
+        uses: actions/cache@v4
+        with:
+          path: ~/.m2/repository
+          key: m2-${{ runner.os }}-${{ hashFiles('target-warm/**/pom.xml') }}
+          restore-keys: m2-${{ runner.os }}-
+
+      - name: Cache Gradle dependencies
+        if: ${{ env.MODE != 'analyze' && env.BUILD_TOOL == 'gradle' }}
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('target-warm/**/*.gradle*', 'target-warm/**/gradle-wrapper.properties') }}
+          restore-keys: gradle-${{ runner.os }}-
+
+      # Trusted warm-up: download every dependency + plugin once, WITH network, no secrets in this step's environment.
+      # It runs the target repo's own build, which is why the Trust check above only lets trusted repos reach this step.
+      - name: Warm the dependency cache
+        if: ${{ env.MODE != 'analyze' }}
+        working-directory: target-warm
+        run: |
+          if [ "$BUILD_TOOL" = "maven" ]; then
+            { if [ -x ./mvnw ]; then ./mvnw -B -ntp verify; else mvn -B -ntp verify; fi; } \
+              || echo "::warning::warm-up build reported failures; continuing (dependencies are cached either way)"
+            echo "CACHE_DIR=$HOME/.m2" >> "$GITHUB_ENV"
+            echo "SANDBOX_IMAGE=maven:3.9-eclipse-temurin-${JAVA_VERSION}" >> "$GITHUB_ENV"
+          else
+            { if [ -x ./gradlew ]; then ./gradlew build --no-daemon; else gradle build --no-daemon; fi; } \
+              || echo "::warning::warm-up build reported failures; continuing (dependencies are cached either way)"
+            echo "CACHE_DIR=$HOME/.gradle" >> "$GITHUB_ENV"
+            echo "SANDBOX_IMAGE=gradle:8-jdk${JAVA_VERSION}" >> "$GITHUB_ENV"
+          fi
+
+      - name: Pull the sandbox image
+        if: ${{ env.MODE != 'analyze' }}
+        run: docker pull "$SANDBOX_IMAGE"
+
+      # ---- run the agent. Tokens exist ONLY in this step; the sandbox container never receives them. ------
+      - name: Run the agent
+        env:
+          AGENT_READ_TOKEN: ${{ secrets.AGENT_READ_TOKEN }}
+          # the write token is only even present in the environment in open-pr mode
+          AGENT_WRITE_TOKEN: ${{ env.MODE == 'open-pr' && secrets.AGENT_WRITE_TOKEN || '' }}
+        run: |
+          URL="https://github.com/${TARGET_REPO}.git"
+          if [ "$CONSENT_KIND" = "file" ]; then CARG=(--consent-file "$CONSENT_VALUE"); else CARG=(--consent "$CONSENT_VALUE"); fi
+          case "$MODE" in
+            analyze) python -m agent analyze "$URL" --out agent-runs "${CARG[@]}" ;;
+            verify)  python -m agent run "$URL" --out agent-runs --sandbox docker "${CARG[@]}" \
+                       --docker-image "$SANDBOX_IMAGE" --java-cache "$CACHE_DIR" --sandbox-memory "$SANDBOX_MEMORY" ;;
+            open-pr) python -m agent run "$URL" --out agent-runs --sandbox docker "${CARG[@]}" \
+                       --docker-image "$SANDBOX_IMAGE" --java-cache "$CACHE_DIR" --sandbox-memory "$SANDBOX_MEMORY" --open-pr ;;
+            *) echo "::error::unknown mode $MODE"; exit 1 ;;
+          esac
+
+      - name: Show the report in the run summary
+        if: ${{ always() }}
+        run: |
+          f=$(ls -d agent-runs/*/report.md 2>/dev/null | head -1 || true)
+          if [ -n "$f" ]; then head -c 200000 "$f" >> "$GITHUB_STEP_SUMMARY"; else echo "No report was produced." >> "$GITHUB_STEP_SUMMARY"; fi
+
+      - name: Upload report, patch, PR body and audit log
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent-run
+          path: agent-runs/
+          retention-days: 14
+          if-no-files-found: warn
